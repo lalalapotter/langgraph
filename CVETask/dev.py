@@ -10,6 +10,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
 
+from reflection import GeneratorGraph, ReflectorGraph, ReflectionGraph
 
 def create_shell_tools_from_config(mcp_config: dict) -> List[ShellTool]:
     """Dynamically creates ShellTools from the mcpServers configuration."""
@@ -83,50 +84,11 @@ auditor_llm = llm.with_structured_output(AuditorOutput)
 
 
 # --- Part 2: Reflection Graph (The Expert Team) ---
-class MessagesState(TypedDict):
-    messages: List[BaseMessage]
+generator_graph = GeneratorGraph(llm=analyst_llm, system_message=analyst_system_prompt).create()
 
-def analyst_node(state: MessagesState):
-    response = analyst_llm.invoke(analyst_system_prompt + "\n\n" + "\n".join([m.content for m in state['messages']]))
-    return {"messages": [response]}
+reflector_graph = ReflectorGraph(llm=auditor_llm, system_message=auditor_system_prompt).create()
 
-generator_graph = StateGraph(MessagesState).add_node("generate", analyst_node).set_entry_point("generate").add_edge("generate", END).compile()
-
-def auditor_node(state: MessagesState):
-    analysis_message = state['messages'][-1]
-    prompt_for_auditor = f"Please audit the following CVE analysis and respond in JSON format:\n\n{analysis_message.content}"
-    critique_obj: AuditorOutput = auditor_llm.invoke(auditor_system_prompt + "\n\n" + prompt_for_auditor)
-    
-    if not critique_obj.is_credible:
-        logging.warning(f"Analysis failed audit. Critique: {critique_obj.critique}")
-        return {"messages": [HumanMessage(content=critique_obj.critique)]}
-    else:
-        logging.info("Analysis passed audit.")
-        return {"messages": [AIMessage(content="Audit passed.")]}
-
-reflector_graph = StateGraph(MessagesState).add_node("reflect", auditor_node).set_entry_point("reflect").add_edge("reflect", END).compile()
-
-class ReflectionState(TypedDict):
-    messages: List[BaseMessage]
-    reflection_count: int
-
-def should_reflect(state: ReflectionState):
-    if state["reflection_count"] >= 3:
-        logging.warning("Reflection limit reached, exiting loop.")
-        return END
-    last_msg = state["messages"][-1]
-    if isinstance(last_msg, AIMessage) and last_msg.content == "Audit passed":
-        return END
-    return "analyze_and_reflect"
-
-def expert_team_node(state: ReflectionState):
-    analysis_result = generator_graph.invoke({"messages": state["messages"]})
-    reflection_result = reflector_graph.invoke({"messages": analysis_result["messages"]})
-    all_messages = state["messages"] + analysis_result["messages"] + reflection_result["messages"]
-    return {"messages": all_messages, "reflection_count": state.get("reflection_count", 0) + 1}
-
-expert_team_graph = StateGraph(ReflectionState).add_node("analyze_and_reflect", expert_team_node).set_entry_point("analyze_and_reflect").add_conditional_edges("analyze_and_reflect", should_reflect).compile()
-
+rgraph = ReflectionGraph(generator_graph=generator_graph, reflector_graph=reflector_graph).create()
 
 # --- Part 3: Main Workflow Graph ---
 class MainGraphState(TypedDict):
@@ -167,7 +129,7 @@ def analyze_single_cve(cve: dict) -> dict:
     cve_id = cve.get('VulnerabilityID')
     initial_prompt = f"Please analyze the following CVE:\n\n{json.dumps(cve, indent=2, ensure_ascii=False)}"
     initial_state = {"messages": [HumanMessage(content=initial_prompt)], "reflection_count": 0}
-    final_state = expert_team_graph.invoke(initial_state)
+    final_state = rgraph.invoke(initial_state)
     
     final_analysis_msg = None
     for i in range(len(final_state["messages"]) - 1, 0, -1):
