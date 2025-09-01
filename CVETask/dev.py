@@ -6,48 +6,58 @@ from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_community.tools import ShellTool
-from langchain_openai import ChatOpenAI 
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
 
+from context import Context
+from state import ReflectionState
 from reflection import GeneratorGraph, ReflectorGraph, ReflectionGraph
+from react import ReActGraph
+
 
 def create_shell_tools_from_config(mcp_config: dict) -> List[ShellTool]:
     """Dynamically creates ShellTools from the mcpServers configuration."""
     tools = []
     for name, config in mcp_config.items():
         command_str = f"{config['command']} {' '.join(config.get('args', []))}"
-        tool_instance = ShellTool(name=name, description=f"Executes: '{command_str}'.", command=command_str)
+        tool_instance = ShellTool(
+            name=name, description=f"Executes: '{command_str}'.", command=command_str
+        )
         tools.append(tool_instance)
     logging.info(f"Created {len(tools)} shell tools from config.")
     return tools
 
+
 # Import the newly defined, framework-agnostic tools
 from langgraph_cve_tools import (
-    trivy_scanner, 
-    json_to_csv_converter, 
-    cve_classifier, 
-    cve_report_generator
+    trivy_scanner,
+    json_to_csv_converter,
+    cve_classifier,
+    cve_report_generator,
 )
 
 # --- Global Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # --- Part 1: LLM and Agent Configuration ---
 llm = ChatOpenAI(
     model="Qwen/Qwen3-Coder-480B-A35B-Instruct",
-    max_tokens=4096, # Set a reasonable max_tokens
-    timeout=120,    # Set a timeout in seconds
+    max_tokens=4096,  # Set a reasonable max_tokens
+    timeout=120,  # Set a timeout in seconds
     max_retries=2,
     # IMPORTANT: Replace with your valid ModelScope API Key
-    api_key="ms-30184ba8-077f-4abf-a40d-97e8d6fc7cb7", 
+    # api_key="ms-30184ba8-077f-4abf-a40d-97e8d6fc7cb7",
+    api_key="ms-df44f694-9197-4fff-beaf-677b6bdc5e1b",
     base_url="https://api-inference.modelscope.cn/v1",
 )
 
 mcpServers_config = {
-    'time': { 'command': 'date' },
-    'fetch': { 'command': 'curl', 'args': ['-L'] },
-    'filesystem_ls': { 'command': 'ls', 'args': ['-l', '.'] } 
+    "time": {"command": "date"},
+    "fetch": {"command": "curl", "args": ["-L"]},
+    "filesystem_ls": {"command": "ls", "args": ["-l", "."]},
 }
 mcp_tools = create_shell_tools_from_config(mcpServers_config)
 
@@ -76,19 +86,35 @@ You MUST reply ONLY with a valid JSON object in the following format, with no ad
 }
 """
 
+
 class AuditorOutput(BaseModel):
     is_credible: bool
     critique: str
+
 
 auditor_llm = llm.with_structured_output(AuditorOutput)
 
 
 # --- Part 2: Reflection Graph (The Expert Team) ---
-generator_graph = GeneratorGraph(llm=analyst_llm, system_message=analyst_system_prompt).create()
+# generator_graph = GeneratorGraph(
+#     state_schema=ReflectionState,
+#     context_schema=Context(llm=analyst_llm, system_prompt=analyst_system_prompt),
+# ).create()
 
-reflector_graph = ReflectorGraph(llm=auditor_llm, system_message=auditor_system_prompt).create()
+generator_graph = ReActGraph(
+    state_schema=ReflectionState,
+    context_schema=Context(llm=analyst_llm, system_prompt=analyst_system_prompt),
+).create()
 
-rgraph = ReflectionGraph(generator_graph=generator_graph, reflector_graph=reflector_graph).create()
+reflector_graph = ReflectorGraph(
+    state_schema=ReflectionState,
+    context_schema=Context(llm=auditor_llm, system_prompt=auditor_system_prompt),
+).create()
+
+rgraph = ReflectionGraph(
+    generator_graph=generator_graph, reflector_graph=reflector_graph
+).create()
+
 
 # --- Part 3: Main Workflow Graph ---
 class MainGraphState(TypedDict):
@@ -102,72 +128,132 @@ class MainGraphState(TypedDict):
     expert_analysis_results: List[dict]
     final_report_message: str
 
+
 def scan_images_node(state: MainGraphState) -> dict:
     logging.info("Main Workflow: Phase 1 -> Scanning images...")
     with ThreadPoolExecutor() as executor:
-        future_target = executor.submit(trivy_scanner.invoke, {"image_name": state["target_image"]})
-        future_base = executor.submit(trivy_scanner.invoke, {"image_name": state["base_image"]})
-        target_res, base_res = json.loads(future_target.result()), json.loads(future_base.result())
+        future_target = executor.submit(
+            trivy_scanner.invoke, {"image_name": state["target_image"]}
+        )
+        future_base = executor.submit(
+            trivy_scanner.invoke, {"image_name": state["base_image"]}
+        )
+        target_res, base_res = json.loads(future_target.result()), json.loads(
+            future_base.result()
+        )
 
     if "error" in target_res or "error" in base_res:
-        raise ValueError(f"Image scanning failed. Target: {target_res.get('error')}, Base: {base_res.get('error')}")
-    return {"target_scan_path": target_res["output_path"], "base_scan_path": base_res["output_path"]}
+        raise ValueError(
+            f"Image scanning failed. Target: {target_res.get('error')}, Base: {base_res.get('error')}"
+        )
+    return {
+        "target_scan_path": target_res["output_path"],
+        "base_scan_path": base_res["output_path"],
+    }
+
 
 def classify_cves_node(state: MainGraphState) -> dict:
     logging.info("Main Workflow: Phase 2 -> Classifying CVEs...")
-    target_csv_res = json.loads(json_to_csv_converter.invoke({"json_file_path": state["target_scan_path"]}))
-    base_csv_res = json.loads(json_to_csv_converter.invoke({"json_file_path": state["base_scan_path"]}))
-    
-    classification_result = cve_classifier.invoke({"target_csv_path": target_csv_res["output_path"], "base_csv_path": base_csv_res["output_path"]})
-    
-    preliminary_report = cve_report_generator.invoke({"classified_cves": {"type1_cves": classification_result["type1_cves"], "type2_cves": classification_result["type2_cves"], "type3_results": []}})
-    logging.info(f"Preliminary report for Type-1/2 CVEs generated: {preliminary_report}")
-    
-    return {"type1_cves": classification_result["type1_cves"], "type2_cves": classification_result["type2_cves"], "type3_cves": classification_result["type3_cves_to_analyze"]}
+    target_csv_res = json.loads(
+        json_to_csv_converter.invoke({"json_file_path": state["target_scan_path"]})
+    )
+    base_csv_res = json.loads(
+        json_to_csv_converter.invoke({"json_file_path": state["base_scan_path"]})
+    )
+
+    classification_result = cve_classifier.invoke(
+        {
+            "target_csv_path": target_csv_res["output_path"],
+            "base_csv_path": base_csv_res["output_path"],
+        }
+    )
+
+    preliminary_report = cve_report_generator.invoke(
+        {
+            "classified_cves": {
+                "type1_cves": classification_result["type1_cves"],
+                "type2_cves": classification_result["type2_cves"],
+                "type3_results": [],
+            }
+        }
+    )
+    logging.info(
+        f"Preliminary report for Type-1/2 CVEs generated: {preliminary_report}"
+    )
+
+    return {
+        "type1_cves": classification_result["type1_cves"],
+        "type2_cves": classification_result["type2_cves"],
+        "type3_cves": classification_result["type3_cves_to_analyze"],
+    }
+
 
 def analyze_single_cve(cve: dict) -> dict:
-    cve_id = cve.get('VulnerabilityID')
+    cve_id = cve.get("VulnerabilityID")
     initial_prompt = f"Please analyze the following CVE:\n\n{json.dumps(cve, indent=2, ensure_ascii=False)}"
-    initial_state = {"messages": [HumanMessage(content=initial_prompt)], "reflection_count": 0}
-    final_state = rgraph.invoke(initial_state)
-    
+    initial_state = {
+        "messages": [HumanMessage(content=initial_prompt)],
+        "reflection_count": 0,
+    }
+    final_state = rgraph.invoke(initial_state, {"recursion_limit": 200})
+
     final_analysis_msg = None
     for i in range(len(final_state["messages"]) - 1, 0, -1):
         if final_state["messages"][i].content == "Audit passed":
-            final_analysis_msg = final_state["messages"][i-1]
+            final_analysis_msg = final_state["messages"][i - 1]
             break
     if not final_analysis_msg and len(final_state["messages"]) > 1:
         if isinstance(final_state["messages"][-1], AIMessage):
-             final_analysis_msg = final_state["messages"][-1] # reflection limit reached case
+            final_analysis_msg = final_state["messages"][
+                -1
+            ]  # reflection limit reached case
         elif len(final_state["messages"]) > 2:
-             final_analysis_msg = final_state["messages"][-2]
+            final_analysis_msg = final_state["messages"][-2]
 
     if final_analysis_msg and isinstance(final_analysis_msg, AIMessage):
         try:
             return {"cve": cve, "analysis": json.loads(final_analysis_msg.content)}
         except json.JSONDecodeError:
-            return {"cve": cve, "analysis": {"error": "Invalid JSON output from analyst."}}
-    return {"cve": cve, "analysis": {"error": "Analysis failed to produce valid output."}}
+            return {
+                "cve": cve,
+                "analysis": {"error": "Invalid JSON output from analyst."},
+            }
+    return {
+        "cve": cve,
+        "analysis": {"error": "Analysis failed to produce valid output."},
+    }
+
 
 def expert_analysis_node(state: MainGraphState) -> dict:
     cve_list = state["type3_cves"]
-    logging.info(f"Main Workflow: Phase 3 -> Starting parallel expert analysis for {len(cve_list)} CVEs.")
+    logging.info(
+        f"Main Workflow: Phase 3 -> Starting parallel expert analysis for {len(cve_list)} CVEs."
+    )
     all_results = []
     with ThreadPoolExecutor(max_workers=2) as executor:
         all_results = list(executor.map(analyze_single_cve, cve_list))
     return {"expert_analysis_results": all_results}
 
+
 def final_report_node(state: MainGraphState) -> dict:
     logging.info("Main Workflow: Final Phase -> Generating final reports...")
-    final_payload = {"classified_cves": {"type1_cves": state["type1_cves"], "type2_cves": state["type2_cves"], "type3_results": state["type3_cves"]}}
+    final_payload = {
+        "classified_cves": {
+            "type1_cves": state["type1_cves"],
+            "type2_cves": state["type2_cves"],
+            "type3_results": state["type3_cves"],
+        }
+    }
     report_message = cve_report_generator.invoke(final_payload)
     return {"final_report_message": report_message}
+
 
 def should_start_expert_analysis(state: MainGraphState) -> str:
     if state["type3_cves"]:
         return "expert_analysis"
     state["expert_analysis_results"] = []
     return "final_report"
+
 
 workflow_builder = StateGraph(MainGraphState)
 workflow_builder.add_node("scan_images", scan_images_node)
@@ -176,25 +262,32 @@ workflow_builder.add_node("expert_analysis", expert_analysis_node)
 workflow_builder.add_node("final_report", final_report_node)
 workflow_builder.set_entry_point("scan_images")
 workflow_builder.add_edge("scan_images", "classify_cves")
-workflow_builder.add_conditional_edges("classify_cves", should_start_expert_analysis, {"expert_analysis": "expert_analysis", "final_report": "final_report"})
+workflow_builder.add_conditional_edges(
+    "classify_cves",
+    should_start_expert_analysis,
+    {"expert_analysis": "expert_analysis", "final_report": "final_report"},
+)
 workflow_builder.add_edge("expert_analysis", "final_report")
 workflow_builder.add_edge("final_report", END)
 main_workflow = workflow_builder.compile()
 
 
 # --- Part 4: Execution Entry Point ---
-if __name__ == '__main__':
-    inputs = {
-        "target_image": "nginx:1.14.2-alpine",
-        "base_image": "debian:stretch-slim",
-    }
+if __name__ == "__main__":
+    # inputs = {
+    #     "target_image": "nginx:1.14.2-alpine",
+    #     "base_image": "debian:stretch-slim",
+    # }
+    inputs = {"target_image": "intel/llm-scaler-vllm:0.2.0-b1", "base_image": "intel/deep-learning-essentials:2025.0.2-0-devel-ubuntu24.04"}
     print("🚀 Starting CVE analysis workflow (Final Version - Decoupled Tools)...")
-    
+
     for event in main_workflow.stream(inputs, stream_mode="values"):
         step_name = list(event.keys())[-1]
         print(f"\n✅ Completed Step: {step_name}")
-        print("="*60)
-    
+        print("=" * 60)
+
     final_state = event
     print("\n\n🎉 Workflow finished!")
-    print(f"Final Report:\n{final_state.get('final_report_message', 'No report was generated.')}")
+    print(
+        f"Final Report:\n{final_state.get('final_report_message', 'No report was generated.')}"
+    )
